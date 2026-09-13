@@ -31,49 +31,33 @@ function validUrl(value) {
 // through a residential proxy avoids that check in most cases.
 const COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || "";
 
-// Free public proxy pool (ip:port, scheme varies). These are shared by many
-// people and go dead often, so we rotate through a larger list and allow
-// more attempts before giving up.
-const PROXIES = [
-  "http://165.101.230.76:8080",
-  "http://66.135.27.9:443",
-  "http://208.67.28.27:58090",
-  "http://38.191.194.43:999",
-  "http://123.138.24.112:8800",
-  "http://186.227.196.104:3128",
-  "http://23.143.160.193:999",
-  "socks5://147.45.136.45:1080",
-  "http://38.51.216.56:999",
-  "socks5://218.95.39.108:59999",
-  "socks4://171.236.89.87:1080",
-  "socks5://47.237.110.50:1080",
-  "http://45.174.56.21:999",
-  "http://103.112.163.131:8080",
-  "socks5://178.252.165.226:1080",
-  "socks5://51.222.13.193:10084",
-  "socks5://168.138.219.12:8081",
-  "socks5://91.84.98.74:12546",
-  "http://178.104.234.144:8118",
-  "http://134.249.86.47:8080",
-  "http://200.121.48.195:999",
-  "http://120.28.169.31:5050",
-  "http://103.97.141.40:8080",
-  "socks4://38.190.1.70:1085",
-  "socks5://38.76.196.46:9050",
-  "socks4://88.204.134.234:1080",
-  "socks4://154.88.189.21:5678",
-  "socks5://94.23.218.74:10808",
-  "http://65.109.186.67:10808",
-  "http://2.188.210.83:4443"
-];
+// Free public proxy pool, fetched live from ProxyScrape and sorted so the
+// fastest (lowest reported timeout) proxy is tried first. Cached briefly so
+// we don't hit the API on every single request.
+const PROXY_API_URL =
+  "https://api.proxyscrape.com/v4/free-proxy-list/get?request=get_proxies&proxy_format=protocolipport&format=json&limit=30&skip=0&protocol=http%2Csocks4%2Csocks5&anonymity=elite%2Canonymous%2Ctransparent&timeout=46";
+const PROXY_CACHE_TTL_MS = 5 * 60 * 1000;
+let proxyCache = { list: [], fetchedAt: 0 };
 
-function shuffledProxies() {
-  const arr = [...PROXIES];
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
+async function refreshProxyPool() {
+  try {
+    const res = await fetch(PROXY_API_URL);
+    const data = await res.json();
+    const list = (data.proxies || [])
+      .filter(p => p.alive && p.proxy)
+      .sort((a, b) => (a.timeout ?? Infinity) - (b.timeout ?? Infinity))
+      .map(p => p.proxy);
+    if (list.length) proxyCache = { list, fetchedAt: Date.now() };
+  } catch {
+    // network hiccup fetching the proxy list — keep using the stale cache
   }
-  return arr;
+}
+
+async function getProxyPool() {
+  if (!proxyCache.list.length || Date.now() - proxyCache.fetchedAt > PROXY_CACHE_TTL_MS) {
+    await refreshProxyPool();
+  }
+  return proxyCache.list;
 }
 
 function baseYtArgs(url, { client, proxy }) {
@@ -96,7 +80,8 @@ function baseYtArgs(url, { client, proxy }) {
 async function runYtDlpWithRotation(url, buildArgs, { maxAttempts = 12, timeoutMs = 12000 } = {}) {
   const isYouTube = /youtu\.?be/i.test(url);
   const clients = isYouTube ? ["android", "ios"] : [null];
-  const proxyOptions = isYouTube ? [...shuffledProxies(), null] : [null];
+  const pool = isYouTube ? await getProxyPool() : [];
+  const proxyOptions = isYouTube ? [...pool, null] : [null];
 
   let lastError;
   let attempts = 0;
