@@ -31,23 +31,41 @@ function validUrl(value) {
 // through a residential proxy avoids that check in most cases.
 const COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || "";
 
-// Webshare residential proxy pool (ip:port:user:pass). A proxy that gets
-// bot-checked or times out is skipped in favor of the next one.
+// Free public proxy pool (ip:port, scheme varies). These are shared by many
+// people and go dead often, so we rotate through a larger list and allow
+// more attempts before giving up.
 const PROXIES = [
-  "31.59.20.176:6754:qszxoitg:5s0blp1oufg9",
-  "45.38.107.97:6014:qszxoitg:5s0blp1oufg9",
-  "198.105.121.200:6462:qszxoitg:5s0blp1oufg9",
-  "64.137.96.74:6641:qszxoitg:5s0blp1oufg9",
-  "198.23.243.226:6361:qszxoitg:5s0blp1oufg9",
-  "38.154.185.97:6370:qszxoitg:5s0blp1oufg9",
-  "84.247.60.125:6095:qszxoitg:5s0blp1oufg9",
-  "142.111.67.146:5611:qszxoitg:5s0blp1oufg9",
-  "191.96.254.138:6185:qszxoitg:5s0blp1oufg9",
-  "31.58.9.4:6077:qszxoitg:5s0blp1oufg9"
-].map(line => {
-  const [host, port, user, pass] = line.split(":");
-  return `http://${user}:${pass}@${host}:${port}`;
-});
+  "http://165.101.230.76:8080",
+  "http://66.135.27.9:443",
+  "http://208.67.28.27:58090",
+  "http://38.191.194.43:999",
+  "http://123.138.24.112:8800",
+  "http://186.227.196.104:3128",
+  "http://23.143.160.193:999",
+  "socks5://147.45.136.45:1080",
+  "http://38.51.216.56:999",
+  "socks5://218.95.39.108:59999",
+  "socks4://171.236.89.87:1080",
+  "socks5://47.237.110.50:1080",
+  "http://45.174.56.21:999",
+  "http://103.112.163.131:8080",
+  "socks5://178.252.165.226:1080",
+  "socks5://51.222.13.193:10084",
+  "socks5://168.138.219.12:8081",
+  "socks5://91.84.98.74:12546",
+  "http://178.104.234.144:8118",
+  "http://134.249.86.47:8080",
+  "http://200.121.48.195:999",
+  "http://120.28.169.31:5050",
+  "http://103.97.141.40:8080",
+  "socks4://38.190.1.70:1085",
+  "socks5://38.76.196.46:9050",
+  "socks4://88.204.134.234:1080",
+  "socks4://154.88.189.21:5678",
+  "socks5://94.23.218.74:10808",
+  "http://65.109.186.67:10808",
+  "http://2.188.210.83:4443"
+];
 
 function shuffledProxies() {
   const arr = [...PROXIES];
@@ -71,9 +89,9 @@ function baseYtArgs(url, { client, proxy }) {
 }
 
 // Tries the request across a shuffled proxy pool (and android/ios clients),
-// stopping at the first success. Only retries on bot-check-style errors;
-// any other error (bad URL, private video, etc.) is thrown immediately.
-async function runYtDlpWithRotation(url, buildArgs, { maxAttempts = 5 } = {}) {
+// stopping at the first success. Only retries on bot-check/timeout-style
+// errors; any other error (bad URL, private video, etc.) is thrown immediately.
+async function runYtDlpWithRotation(url, buildArgs, { maxAttempts = 10, timeoutMs = 20000 } = {}) {
   const isYouTube = /youtu\.?be/i.test(url);
   const clients = isYouTube ? ["android", "ios"] : [null];
   const proxyOptions = isYouTube ? [...shuffledProxies(), null] : [null];
@@ -86,27 +104,45 @@ async function runYtDlpWithRotation(url, buildArgs, { maxAttempts = 5 } = {}) {
       attempts++;
       const bypassArgs = client ? baseYtArgs(url, { client, proxy }) : (proxy ? ["--proxy", proxy] : []);
       try {
-        return await runYtDlp(buildArgs(bypassArgs));
+        return await runYtDlp(buildArgs(bypassArgs), timeoutMs);
       } catch (err) {
         lastError = err;
-        const looksLikeBotCheck = /sign in to confirm|not a bot|http error 429/i.test(err.message || "");
-        if (!looksLikeBotCheck) throw err; // real error, no point retrying
+        const retryable = /sign in to confirm|not a bot|http error 429|timed out|tunnel connection failed|proxy/i.test(err.message || "");
+        if (!retryable) throw err; // real error, no point retrying
       }
     }
   }
   throw lastError;
 }
 
-function runYtDlp(args) {
+function runYtDlp(args, timeoutMs = 20000) {
   return new Promise((resolve, reject) => {
     const child = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "", stderr = "";
+    let stdout = "", stderr = "", settled = false;
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      reject(new Error("proxy timed out (not a bot)"));
+    }, timeoutMs);
+
     child.stdout.on("data", d => { stdout += d.toString(); });
     child.stderr.on("data", d => { stderr += d.toString(); });
-    child.on("error", reject);
-    child.on("close", code => code === 0
-      ? resolve({ stdout, stderr })
-      : reject(new Error(stderr.trim() || `yt-dlp exited with code ${code}`)));
+    child.on("error", err => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", code => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      code === 0
+        ? resolve({ stdout, stderr })
+        : reject(new Error(stderr.trim() || `yt-dlp exited with code ${code}`));
+    });
   });
 }
 
@@ -209,7 +245,7 @@ app.get("/api/download", async (req, res) => {
           );
         }
 
-        await runYtDlpWithRotation(url, (bypassArgs) => [...args, ...bypassArgs, url]);
+        await runYtDlpWithRotation(url, (bypassArgs) => [...args, ...bypassArgs, url], { timeoutMs: 45000 });
 
         const names = await readdir(workDir);
         const candidates = names.filter(n =>
