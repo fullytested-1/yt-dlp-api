@@ -66,7 +66,7 @@ async function getInfo(url) {
 app.get("/", (_req, res) => res.json({
   status: true,
   name: "yt-dlp-api",
-  version: "1.2.0",
+  version: "1.2.1",
   concurrency: CONCURRENCY,
   endpoints: {
     info: "/api/info?url=URL",
@@ -215,5 +215,5 @@ app.get("/files/:id", async (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () =>
-  console.log(`yt-dlp API 1.2.0 listening on port ${PORT} (concurrency=${CONCURRENCY})`)
+  console.log(`yt-dlp API 1.2.1 listening on port ${PORT} (concurrency=${CONCURRENCY})`)
 );
