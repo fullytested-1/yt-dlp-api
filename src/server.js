@@ -1,6 +1,6 @@
 import express from "express";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, stat, readdir } from "node:fs/promises";
+import { mkdtemp, rm, stat, readdir, copyFile } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,8 +11,11 @@ const PORT = Number(process.env.PORT || 8000);
 const MAX_AGE_MS = Number(process.env.MAX_DOWNLOAD_AGE_MS || 30 * 60 * 1000);
 const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES || 500 * 1024 * 1024);
 const CONCURRENCY = Math.max(1, Number(process.env.DOWNLOAD_CONCURRENCY || 2));
+const BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
+
 let activeDownloads = 0;
 const queue = [];
+const files = new Map();
 
 app.disable("x-powered-by");
 
@@ -63,7 +66,7 @@ async function getInfo(url) {
 app.get("/", (_req, res) => res.json({
   status: true,
   name: "yt-dlp-api",
-  version: "1.1.0",
+  version: "1.2.0",
   concurrency: CONCURRENCY,
   endpoints: {
     info: "/api/info?url=URL",
@@ -73,7 +76,11 @@ app.get("/", (_req, res) => res.json({
 }));
 
 app.get("/health", (_req, res) => res.json({
-  status: true, service: "yt-dlp-api", activeDownloads, queuedDownloads: queue.length
+  status: true,
+  service: "yt-dlp-api",
+  activeDownloads,
+  queuedDownloads: queue.length,
+  storedFiles: files.size
 }));
 
 app.get("/api/info", async (req, res) => {
@@ -111,24 +118,19 @@ app.get("/api/download", async (req, res) => {
   });
 
   try {
-    await withDownloadSlot(async () => {
+    const result = await withDownloadSlot(async () => {
       const workDir = await mkdtemp(join(tmpdir(), "ytdlp-"));
       const output = join(workDir, `${randomUUID()}.%(ext)s`);
 
       try {
         const args = [
-          "--no-playlist",
-          "--no-warnings",
-          "--restrict-filenames",
-          "--retries", "3",
-          "--fragment-retries", "3",
-          "-o", output
+          "--no-playlist", "--no-warnings", "--restrict-filenames",
+          "--retries", "3", "--fragment-retries", "3", "-o", output
         ];
 
         if (format === "mp3") {
           args.push("-x", "--audio-format", "mp3", "--audio-quality", "0");
         } else {
-          // Prefer MP4/M4A and let FFmpeg remux/merge only when required.
           args.push(
             "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
             "--merge-output-format", "mp4"
@@ -150,41 +152,68 @@ app.get("/api/download", async (req, res) => {
           throw new Error("Generated file is larger than the configured limit.");
         }
 
-        res.setHeader("Content-Type", format === "mp3" ? "audio/mpeg" : "video/mp4");
-        res.setHeader("Content-Disposition", `attachment; filename="download.${format}"`);
-        res.setHeader("Content-Length", fileStat.size);
-        res.setHeader("Cache-Control", "no-store");
+        const id = randomUUID();
+        const publicDir = await mkdtemp(join(tmpdir(), "ytdlp-public-"));
+        const publicPath = join(publicDir, `download.${format}`);
+        await copyFile(filePath, publicPath);
+        await rm(workDir, { recursive:true, force:true }).catch(() => {});
 
-        let cleaned = false;
-        let timer;
-        const cleanup = async () => {
-          if (cleaned) return;
-          cleaned = true;
-          clearTimeout(timer);
-          await rm(workDir, { recursive:true, force:true }).catch(() => {});
-        };
+        const expiresAt = Date.now() + MAX_AGE_MS;
+        files.set(id, { path: publicPath, dir: publicDir, expiresAt, format });
 
-        timer = setTimeout(cleanup, MAX_AGE_MS);
-        res.on("finish", cleanup);
-        res.on("close", cleanup);
+        setTimeout(async () => {
+          const item = files.get(id);
+          if (!item) return;
+          files.delete(id);
+          await rm(item.dir, { recursive:true, force:true }).catch(() => {});
+        }, MAX_AGE_MS).unref?.();
 
-        createReadStream(filePath)
-          .on("error", async () => { await cleanup(); })
-          .pipe(res);
+        return { id, size:fileStat.size, expiresAt };
       } catch (error) {
         await rm(workDir, { recursive:true, force:true }).catch(() => {});
-        if (!res.headersSent) res.status(500).json({
-          status:false, error:error.message
-        });
+        throw error;
       }
     });
-  } catch (error) {
-    if (!res.headersSent) res.status(503).json({
-      status:false, error:error.message || "Download queue failed."
+
+    const host = BASE_URL || `${req.protocol}://${req.get("host")}`;
+    res.json({
+      status: true,
+      format,
+      size: result.size,
+      expires_at: new Date(result.expiresAt).toISOString(),
+      download: `${host}/files/${result.id}`
     });
+  } catch (error) {
+    res.status(500).json({ status:false, error:error.message });
+  }
+});
+
+app.get("/files/:id", async (req, res) => {
+  const item = files.get(req.params.id);
+  if (!item || item.expiresAt <= Date.now()) {
+    if (item) {
+      files.delete(req.params.id);
+      await rm(item.dir, { recursive:true, force:true }).catch(() => {});
+    }
+    return res.status(404).json({ status:false, error:"Download link expired or not found." });
+  }
+
+  try {
+    const fileStat = await stat(item.path);
+    res.setHeader("Content-Type", item.format === "mp3" ? "audio/mpeg" : "video/mp4");
+    res.setHeader("Content-Disposition", `attachment; filename="download.${item.format}"`);
+    res.setHeader("Content-Length", fileStat.size);
+    res.setHeader("Cache-Control", "no-store");
+    createReadStream(item.path).on("error", () => {
+      if (!res.headersSent) res.status(500).end();
+    }).pipe(res);
+  } catch {
+    files.delete(req.params.id);
+    await rm(item.dir, { recursive:true, force:true }).catch(() => {});
+    res.status(404).json({ status:false, error:"File is no longer available." });
   }
 });
 
 app.listen(PORT, "0.0.0.0", () =>
-  console.log(`yt-dlp API listening on port ${PORT} (concurrency=${CONCURRENCY})`)
+  console.log(`yt-dlp API 1.2.0 listening on port ${PORT} (concurrency=${CONCURRENCY})`)
 );
