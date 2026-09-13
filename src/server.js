@@ -27,22 +27,74 @@ function validUrl(value) {
 }
 
 // Cloud/datacenter IPs get flagged by YouTube's bot-check far more than
-// residential IPs. Spoofing the Android client player (and, if present,
-// riding along on an exported cookies.txt) avoids that check in most cases.
+// residential IPs. Spoofing the Android/iOS client player and routing
+// through a residential proxy avoids that check in most cases.
 const COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || "";
-const PLAYER_CLIENT = process.env.YTDLP_PLAYER_CLIENT || "android";
 
-function ytBypassArgs(url) {
+// Webshare residential proxy pool (ip:port:user:pass). A proxy that gets
+// bot-checked or times out is skipped in favor of the next one.
+const PROXIES = [
+  "31.59.20.176:6754:qszxoitg:5s0blp1oufg9",
+  "45.38.107.97:6014:qszxoitg:5s0blp1oufg9",
+  "198.105.121.200:6462:qszxoitg:5s0blp1oufg9",
+  "64.137.96.74:6641:qszxoitg:5s0blp1oufg9",
+  "198.23.243.226:6361:qszxoitg:5s0blp1oufg9",
+  "38.154.185.97:6370:qszxoitg:5s0blp1oufg9",
+  "84.247.60.125:6095:qszxoitg:5s0blp1oufg9",
+  "142.111.67.146:5611:qszxoitg:5s0blp1oufg9",
+  "191.96.254.138:6185:qszxoitg:5s0blp1oufg9",
+  "31.58.9.4:6077:qszxoitg:5s0blp1oufg9"
+].map(line => {
+  const [host, port, user, pass] = line.split(":");
+  return `http://${user}:${pass}@${host}:${port}`;
+});
+
+function shuffledProxies() {
+  const arr = [...PROXIES];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function baseYtArgs(url, { client, proxy }) {
   const args = [];
   const isYouTube = /youtu\.?be/i.test(url);
   if (isYouTube) {
-    args.push("--extractor-args", `youtube:player_client=${PLAYER_CLIENT}`);
+    args.push("--extractor-args", `youtube:player_client=${client}`);
     args.push("--user-agent", "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip");
   }
-  if (COOKIES_FILE) {
-    args.push("--cookies", COOKIES_FILE);
-  }
+  if (COOKIES_FILE) args.push("--cookies", COOKIES_FILE);
+  if (proxy) args.push("--proxy", proxy);
   return args;
+}
+
+// Tries the request across a shuffled proxy pool (and android/ios clients),
+// stopping at the first success. Only retries on bot-check-style errors;
+// any other error (bad URL, private video, etc.) is thrown immediately.
+async function runYtDlpWithRotation(url, buildArgs, { maxAttempts = 5 } = {}) {
+  const isYouTube = /youtu\.?be/i.test(url);
+  const clients = isYouTube ? ["android", "ios"] : [null];
+  const proxyOptions = isYouTube ? [...shuffledProxies(), null] : [null];
+
+  let lastError;
+  let attempts = 0;
+  for (const client of clients) {
+    for (const proxy of proxyOptions) {
+      if (attempts >= maxAttempts) break;
+      attempts++;
+      const bypassArgs = client ? baseYtArgs(url, { client, proxy }) : (proxy ? ["--proxy", proxy] : []);
+      try {
+        return await runYtDlp(buildArgs(bypassArgs));
+      } catch (err) {
+        lastError = err;
+        const looksLikeBotCheck = /sign in to confirm|not a bot|http error 429/i.test(err.message || "");
+        if (!looksLikeBotCheck) throw err; // real error, no point retrying
+      }
+    }
+  }
+  throw lastError;
 }
 
 function runYtDlp(args) {
@@ -76,9 +128,9 @@ function withDownloadSlot(task) {
 }
 
 async function getInfo(url) {
-  const { stdout } = await runYtDlp([
+  const { stdout } = await runYtDlpWithRotation(url, (bypassArgs) => [
     "--dump-single-json", "--no-playlist", "--no-warnings",
-    ...ytBypassArgs(url), url
+    ...bypassArgs, url
   ]);
   return JSON.parse(stdout);
 }
@@ -157,22 +209,7 @@ app.get("/api/download", async (req, res) => {
           );
         }
 
-        args.push(...ytBypassArgs(url), url);
-
-        try {
-          await runYtDlp(args);
-        } catch (err) {
-          // If the android client got bot-checked, retry once with ios.
-          const isYouTube = /youtu\.?be/i.test(url);
-          const looksLikeBotCheck = /sign in to confirm|not a bot/i.test(err.message || "");
-          if (isYouTube && looksLikeBotCheck && PLAYER_CLIENT !== "ios") {
-            const retryArgs = args.map(a => a === PLAYER_CLIENT ? "ios" : a)
-              .map(a => a === `youtube:player_client=${PLAYER_CLIENT}` ? "youtube:player_client=ios" : a);
-            await runYtDlp(retryArgs);
-          } else {
-            throw err;
-          }
-        }
+        await runYtDlpWithRotation(url, (bypassArgs) => [...args, ...bypassArgs, url]);
 
         const names = await readdir(workDir);
         const candidates = names.filter(n =>
