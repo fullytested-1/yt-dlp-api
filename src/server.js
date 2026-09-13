@@ -26,6 +26,25 @@ function validUrl(value) {
   } catch { return false; }
 }
 
+// Cloud/datacenter IPs get flagged by YouTube's bot-check far more than
+// residential IPs. Spoofing the Android client player (and, if present,
+// riding along on an exported cookies.txt) avoids that check in most cases.
+const COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || "";
+const PLAYER_CLIENT = process.env.YTDLP_PLAYER_CLIENT || "android";
+
+function ytBypassArgs(url) {
+  const args = [];
+  const isYouTube = /youtu\.?be/i.test(url);
+  if (isYouTube) {
+    args.push("--extractor-args", `youtube:player_client=${PLAYER_CLIENT}`);
+    args.push("--user-agent", "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip");
+  }
+  if (COOKIES_FILE) {
+    args.push("--cookies", COOKIES_FILE);
+  }
+  return args;
+}
+
 function runYtDlp(args) {
   return new Promise((resolve, reject) => {
     const child = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -58,7 +77,8 @@ function withDownloadSlot(task) {
 
 async function getInfo(url) {
   const { stdout } = await runYtDlp([
-    "--dump-single-json", "--no-playlist", "--no-warnings", url
+    "--dump-single-json", "--no-playlist", "--no-warnings",
+    ...ytBypassArgs(url), url
   ]);
   return JSON.parse(stdout);
 }
@@ -137,8 +157,22 @@ app.get("/api/download", async (req, res) => {
           );
         }
 
-        args.push(url);
-        await runYtDlp(args);
+        args.push(...ytBypassArgs(url), url);
+
+        try {
+          await runYtDlp(args);
+        } catch (err) {
+          // If the android client got bot-checked, retry once with ios.
+          const isYouTube = /youtu\.?be/i.test(url);
+          const looksLikeBotCheck = /sign in to confirm|not a bot/i.test(err.message || "");
+          if (isYouTube && looksLikeBotCheck && PLAYER_CLIENT !== "ios") {
+            const retryArgs = args.map(a => a === PLAYER_CLIENT ? "ios" : a)
+              .map(a => a === `youtube:player_client=${PLAYER_CLIENT}` ? "youtube:player_client=ios" : a);
+            await runYtDlp(retryArgs);
+          } else {
+            throw err;
+          }
+        }
 
         const names = await readdir(workDir);
         const candidates = names.filter(n =>
