@@ -89,9 +89,11 @@ function baseYtArgs(url, { client, proxy }) {
 }
 
 // Tries the request across a shuffled proxy pool (and android/ios clients),
-// stopping at the first success. Only retries on bot-check/timeout-style
-// errors; any other error (bad URL, private video, etc.) is thrown immediately.
-async function runYtDlpWithRotation(url, buildArgs, { maxAttempts = 10, timeoutMs = 20000 } = {}) {
+// stopping at the first success. Keeps trying remaining proxies on ANY
+// failure (dead/refused/bot-checked all look different) up to maxAttempts;
+// the final attempt in the loop is a direct (no-proxy) call, so a genuine
+// content error (private video, etc.) still surfaces clearly at the end.
+async function runYtDlpWithRotation(url, buildArgs, { maxAttempts = 12, timeoutMs = 12000 } = {}) {
   const isYouTube = /youtu\.?be/i.test(url);
   const clients = isYouTube ? ["android", "ios"] : [null];
   const proxyOptions = isYouTube ? [...shuffledProxies(), null] : [null];
@@ -100,15 +102,15 @@ async function runYtDlpWithRotation(url, buildArgs, { maxAttempts = 10, timeoutM
   let attempts = 0;
   for (const client of clients) {
     for (const proxy of proxyOptions) {
-      if (attempts >= maxAttempts) break;
+      if (attempts >= maxAttempts) return Promise.reject(lastError);
       attempts++;
       const bypassArgs = client ? baseYtArgs(url, { client, proxy }) : (proxy ? ["--proxy", proxy] : []);
       try {
         return await runYtDlp(buildArgs(bypassArgs), timeoutMs);
       } catch (err) {
         lastError = err;
-        const retryable = /sign in to confirm|not a bot|http error 429|timed out|tunnel connection failed|proxy/i.test(err.message || "");
-        if (!retryable) throw err; // real error, no point retrying
+        // keep going regardless of error text — a dead proxy can fail in
+        // many different ways (refused, reset, timeout, DNS, bot-check)
       }
     }
   }
@@ -245,7 +247,7 @@ app.get("/api/download", async (req, res) => {
           );
         }
 
-        await runYtDlpWithRotation(url, (bypassArgs) => [...args, ...bypassArgs, url], { timeoutMs: 45000 });
+        await runYtDlpWithRotation(url, (bypassArgs) => [...args, ...bypassArgs, url], { timeoutMs: 35000 });
 
         const names = await readdir(workDir);
         const candidates = names.filter(n =>
