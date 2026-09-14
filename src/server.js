@@ -72,48 +72,18 @@ function baseYtArgs(url, { client, proxy }) {
   return args;
 }
 
-// Tries the request across a shuffled proxy pool (and android/ios clients),
-// stopping at the first success. Keeps trying remaining proxies on ANY
-// failure (dead/refused/bot-checked all look different) up to maxAttempts;
-// the final attempt in the loop is a direct (no-proxy) call, so a genuine
-// content error (private video, etc.) still surfaces clearly at the end.
-async function runYtDlpWithRotation(url, buildArgs, { maxAttempts = 12, timeoutMs = 12000 } = {}) {
-  const isYouTube = /youtu\.?be/i.test(url);
-  const clients = isYouTube ? ["android", "ios"] : [null];
-  const pool = isYouTube ? await getProxyPool() : [];
-  const proxyOptions = isYouTube ? [...pool, null] : [null];
+function spawnYtDlp(args, timeoutMs) {
+  let settled = false;
+  const child = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "", stderr = "";
 
-  let lastError;
-  let attempts = 0;
-  for (const client of clients) {
-    for (const proxy of proxyOptions) {
-      if (attempts >= maxAttempts) return Promise.reject(lastError);
-      attempts++;
-      const bypassArgs = client ? baseYtArgs(url, { client, proxy }) : (proxy ? ["--proxy", proxy] : []);
-      try {
-        return await runYtDlp(buildArgs(bypassArgs), timeoutMs);
-      } catch (err) {
-        lastError = err;
-        // keep going regardless of error text — a dead proxy can fail in
-        // many different ways (refused, reset, timeout, DNS, bot-check)
-      }
-    }
-  }
-  throw lastError;
-}
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    child.kill("SIGKILL");
+  }, timeoutMs);
 
-function runYtDlp(args, timeoutMs = 20000) {
-  return new Promise((resolve, reject) => {
-    const child = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "", stderr = "", settled = false;
-
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill("SIGKILL");
-      reject(new Error("proxy timed out (not a bot)"));
-    }, timeoutMs);
-
+  const promise = new Promise((resolve, reject) => {
     child.stdout.on("data", d => { stdout += d.toString(); });
     child.stderr.on("data", d => { stderr += d.toString(); });
     child.on("error", err => {
@@ -131,6 +101,53 @@ function runYtDlp(args, timeoutMs = 20000) {
         : reject(new Error(stderr.trim() || `yt-dlp exited with code ${code}`));
     });
   });
+
+  const cancel = () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    try { child.kill("SIGKILL"); } catch {}
+  };
+
+  return { promise, cancel };
+}
+
+// Races several proxy/client combinations at once instead of trying them
+// one-by-one — much faster in practice since we don't wait out a full
+// timeout on every dead proxy before moving to the next. Whichever finishes
+// first wins; the rest are killed immediately.
+async function runYtDlpWithRotation(url, buildArgs, { maxAttempts = 8, timeoutMs = 10000, batchSize = 4 } = {}) {
+  const isYouTube = /youtu\.?be/i.test(url);
+  const clients = isYouTube ? ["android", "ios"] : [null];
+  const pool = isYouTube ? await getProxyPool() : [];
+  const proxyOptions = isYouTube ? [...pool, null] : [null];
+
+  const candidates = [];
+  outer:
+  for (const client of clients) {
+    for (const proxy of proxyOptions) {
+      candidates.push({ client, proxy });
+      if (candidates.length >= maxAttempts) break outer;
+    }
+  }
+
+  let lastError;
+  for (let i = 0; i < candidates.length; i += batchSize) {
+    const batch = candidates.slice(i, i + batchSize);
+    const runners = batch.map(({ client, proxy }) => {
+      const bypassArgs = client ? baseYtArgs(url, { client, proxy }) : (proxy ? ["--proxy", proxy] : []);
+      return spawnYtDlp(buildArgs(bypassArgs), timeoutMs);
+    });
+    try {
+      const result = await Promise.any(runners.map(r => r.promise));
+      runners.forEach(r => r.cancel());
+      return result;
+    } catch (aggErr) {
+      lastError = aggErr?.errors?.length ? aggErr.errors[aggErr.errors.length - 1] : aggErr;
+      runners.forEach(r => r.cancel());
+    }
+  }
+  throw lastError || new Error("All proxy attempts failed.");
 }
 
 function withDownloadSlot(task) {
@@ -232,7 +249,7 @@ app.get("/api/download", async (req, res) => {
           );
         }
 
-        await runYtDlpWithRotation(url, (bypassArgs) => [...args, ...bypassArgs, url], { timeoutMs: 35000 });
+        await runYtDlpWithRotation(url, (bypassArgs) => [...args, ...bypassArgs, url], { timeoutMs: 25000, batchSize: 3 });
 
         const names = await readdir(workDir);
         const candidates = names.filter(n =>
