@@ -39,10 +39,13 @@ const PROXY_API_URL =
 const PROXY_POOL_SIZE = 50; // keep only the fastest N after sorting the full list
 
 // Fetches a fresh proxy list on every call — no caching — sorted so the
-// fastest (lowest reported timeout) proxies come first.
+// fastest (lowest reported timeout) proxies come first. Has its own timeout
+// so a slow/unresponsive ProxyScrape API can't hang the whole request.
 async function getProxyPool() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
   try {
-    const res = await fetch(PROXY_API_URL);
+    const res = await fetch(PROXY_API_URL, { signal: controller.signal });
     const data = await res.json();
     return (data.proxies || [])
       .filter(p => p.alive && p.proxy)
@@ -50,7 +53,9 @@ async function getProxyPool() {
       .slice(0, PROXY_POOL_SIZE)
       .map(p => p.proxy);
   } catch {
-    return []; // API hiccup — caller falls back to a direct (no-proxy) attempt
+    return []; // API hiccup/timeout — caller falls back to a direct (no-proxy) attempt
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -161,11 +166,23 @@ function withDownloadSlot(task) {
   });
 }
 
+function withOverallTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function getInfo(url) {
-  const { stdout } = await runYtDlpWithRotation(url, (bypassArgs) => [
-    "--dump-single-json", "--no-playlist", "--no-warnings",
-    ...bypassArgs, url
-  ]);
+  const { stdout } = await withOverallTimeout(
+    runYtDlpWithRotation(url, (bypassArgs) => [
+      "--dump-single-json", "--no-playlist", "--no-warnings",
+      ...bypassArgs, url
+    ]),
+    30000,
+    "info request"
+  );
   return JSON.parse(stdout);
 }
 
@@ -243,7 +260,11 @@ app.get("/api/download", async (req, res) => {
           );
         }
 
-        await runYtDlpWithRotation(url, (bypassArgs) => [...args, ...bypassArgs, url], { timeoutMs: 25000, batchSize: 3 });
+        await withOverallTimeout(
+          runYtDlpWithRotation(url, (bypassArgs) => [...args, ...bypassArgs, url], { timeoutMs: 9000, batchSize: 3 }),
+          30000,
+          "download request"
+        );
 
         const names = await readdir(workDir);
         const candidates = names.filter(n =>
