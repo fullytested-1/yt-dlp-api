@@ -26,21 +26,10 @@ function validUrl(value) {
   } catch { return false; }
 }
 
-// Cloud/datacenter IPs get flagged by YouTube's bot-check far more than
-// residential IPs. Spoofing the Android/iOS client player and routing
-// through a residential proxy avoids that check in most cases.
 const COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || "";
+const PROXY_API_URL = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json";
+const PROXY_POOL_SIZE = 50;
 
-// Free public proxy pool, fetched live from ProxyScrape and sorted so the
-// fastest (lowest reported timeout) proxy is tried first. Cached briefly so
-// we don't hit the API on every single request.
-const PROXY_API_URL =
-  "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json";
-const PROXY_POOL_SIZE = 50; // keep only the fastest N after sorting the full list
-
-// Fetches a fresh proxy list on every call — no caching — sorted so the
-// fastest (lowest reported timeout) proxies come first. Has its own timeout
-// so a slow/unresponsive ProxyScrape API can't hang the whole request.
 async function getProxyPool() {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8000);
@@ -53,7 +42,7 @@ async function getProxyPool() {
       .slice(0, PROXY_POOL_SIZE)
       .map(p => p.proxy);
   } catch {
-    return []; // API hiccup/timeout — caller falls back to a direct (no-proxy) attempt
+    return [];
   } finally {
     clearTimeout(timer);
   }
@@ -63,7 +52,7 @@ function baseYtArgs(url, { client, proxy }) {
   const args = [];
   const isYouTube = /youtu\.?be/i.test(url);
   if (isYouTube) {
-    args.push("--extractor-args", `youtube:player_client=${client}`);
+    if (client) args.push("--extractor-args", `youtube:player_client=${client}`);
     args.push("--user-agent", "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip");
   }
   if (COOKIES_FILE) args.push("--cookies", COOKIES_FILE);
@@ -111,15 +100,11 @@ function spawnYtDlp(args, timeoutMs) {
   return { promise, cancel };
 }
 
-// Races several proxy/client combinations at once instead of trying them
-// one-by-one — much faster in practice since we don't wait out a full
-// timeout on every dead proxy before moving to the next. Whichever finishes
-// first wins; the rest are killed immediately.
-async function runYtDlpWithRotation(url, buildArgs, { maxAttempts = 8, timeoutMs = 10000, batchSize = 4 } = {}) {
+async function runYtDlpWithRotation(url, buildArgs, { maxAttempts = 8, timeoutMs = 60000, batchSize = 3 } = {}) {
   const isYouTube = /youtu\.?be/i.test(url);
   const clients = isYouTube ? ["android", "ios"] : [null];
   const pool = isYouTube ? await getProxyPool() : [];
-  const proxyOptions = isYouTube ? [...pool, null] : [null];
+  const proxyOptions = isYouTube ? [null, ...pool] : [null];
 
   const candidates = [];
   outer:
@@ -134,9 +119,13 @@ async function runYtDlpWithRotation(url, buildArgs, { maxAttempts = 8, timeoutMs
   for (let i = 0; i < candidates.length; i += batchSize) {
     const batch = candidates.slice(i, i + batchSize);
     const runners = batch.map(({ client, proxy }) => {
-      const bypassArgs = client ? baseYtArgs(url, { client, proxy }) : (proxy ? ["--proxy", proxy] : []);
-      return spawnYtDlp(buildArgs(bypassArgs), timeoutMs);
+      const bypassArgs = baseYtArgs(url, { client, proxy });
+      const runner = spawnYtDlp(buildArgs(bypassArgs), timeoutMs);
+      // Catch unhandled rejection when cancelled
+      runner.promise.catch(() => {});
+      return runner;
     });
+
     try {
       const result = await Promise.any(runners.map(r => r.promise));
       runners.forEach(r => r.cancel());
@@ -179,7 +168,7 @@ async function getInfo(url) {
     runYtDlpWithRotation(url, (bypassArgs) => [
       "--dump-single-json", "--no-playlist", "--no-warnings",
       ...bypassArgs, url
-    ]),
+    ], { timeoutMs: 20000 }),
     30000,
     "info request"
   );
@@ -261,8 +250,8 @@ app.get("/api/download", async (req, res) => {
         }
 
         await withOverallTimeout(
-          runYtDlpWithRotation(url, (bypassArgs) => [...args, ...bypassArgs, url], { timeoutMs: 9000, batchSize: 3 }),
-          30000,
+          runYtDlpWithRotation(url, (bypassArgs) => [...args, ...bypassArgs, url], { timeoutMs: 90000, batchSize: 3 }),
+          120000,
           "download request"
         );
 
@@ -340,6 +329,6 @@ app.get("/files/:id", async (req, res) => {
   }
 });
 
-app.listen(PORT, "0.0.0.0", () =>
+app.listen(PORT, () =>
   console.log(`yt-dlp API 1.2.1 listening on port ${PORT} (concurrency=${CONCURRENCY})`)
 );
