@@ -53,11 +53,20 @@ async function refreshProxyPool() {
   }
 }
 
+// Each call returns the pool rotated to a different starting point, so
+// back-to-back requests don't all pile onto the same "fastest" proxy —
+// every request effectively gets its own proxy to start with, while still
+// preferring lower-latency ones over higher-latency ones from there.
+let rotationCursor = 0;
 async function getProxyPool() {
   if (!proxyCache.list.length || Date.now() - proxyCache.fetchedAt > PROXY_CACHE_TTL_MS) {
     await refreshProxyPool();
   }
-  return proxyCache.list;
+  const list = proxyCache.list;
+  if (!list.length) return [];
+  const start = rotationCursor % list.length;
+  rotationCursor = (rotationCursor + 1) % list.length;
+  return [...list.slice(start), ...list.slice(0, start)];
 }
 
 function baseYtArgs(url, { client, proxy }) {
