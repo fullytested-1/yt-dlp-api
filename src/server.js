@@ -35,38 +35,23 @@ const COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || "";
 // fastest (lowest reported timeout) proxy is tried first. Cached briefly so
 // we don't hit the API on every single request.
 const PROXY_API_URL =
-  "https://api.proxyscrape.com/v4/free-proxy-list/get?request=get_proxies&proxy_format=protocolipport&format=json&limit=30&skip=0&protocol=http%2Csocks4%2Csocks5&anonymity=elite%2Canonymous%2Ctransparent&timeout=46";
-const PROXY_CACHE_TTL_MS = 5 * 60 * 1000;
-let proxyCache = { list: [], fetchedAt: 0 };
+  "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json";
+const PROXY_POOL_SIZE = 50; // keep only the fastest N after sorting the full list
 
-async function refreshProxyPool() {
+// Fetches a fresh proxy list on every call — no caching — sorted so the
+// fastest (lowest reported timeout) proxies come first.
+async function getProxyPool() {
   try {
     const res = await fetch(PROXY_API_URL);
     const data = await res.json();
-    const list = (data.proxies || [])
+    return (data.proxies || [])
       .filter(p => p.alive && p.proxy)
       .sort((a, b) => (a.timeout ?? Infinity) - (b.timeout ?? Infinity))
+      .slice(0, PROXY_POOL_SIZE)
       .map(p => p.proxy);
-    if (list.length) proxyCache = { list, fetchedAt: Date.now() };
   } catch {
-    // network hiccup fetching the proxy list — keep using the stale cache
+    return []; // API hiccup — caller falls back to a direct (no-proxy) attempt
   }
-}
-
-// Each call returns the pool rotated to a different starting point, so
-// back-to-back requests don't all pile onto the same "fastest" proxy —
-// every request effectively gets its own proxy to start with, while still
-// preferring lower-latency ones over higher-latency ones from there.
-let rotationCursor = 0;
-async function getProxyPool() {
-  if (!proxyCache.list.length || Date.now() - proxyCache.fetchedAt > PROXY_CACHE_TTL_MS) {
-    await refreshProxyPool();
-  }
-  const list = proxyCache.list;
-  if (!list.length) return [];
-  const start = rotationCursor % list.length;
-  rotationCursor = (rotationCursor + 1) % list.length;
-  return [...list.slice(start), ...list.slice(0, start)];
 }
 
 function baseYtArgs(url, { client, proxy }) {
